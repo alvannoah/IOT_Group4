@@ -1,5 +1,6 @@
 // Reads the PZEM-004T and YF-S201, sends the readings to the FastAPI backend through the
-// ESP-01, and opens or closes the solenoid as the backend says.
+// ESP-01, and switches the water (solenoid valve and pump together) and the LED strip as the
+// backend says.
 #include <Arduino.h>
 #include <PZEM004Tv30.h>
 #include <SoftwareSerial.h>
@@ -26,9 +27,14 @@ unsigned long lastWaterSend = 0;
 unsigned long lastElectricitySend = 0;
 unsigned long lastValvePoll = 0;
 unsigned long lastWifiAttempt = 0;
+unsigned long lastBackendReply = 0;
+unsigned long pumpStartedAt = 0;
 
 bool wifiConnected = false;
 bool valveOpen = false;
+bool pumpOn = false;
+bool waterLockedOut = false;  // Pump hit its run-time limit; water stays off until the backend says off.
+bool ledOn = false;
 uint8_t failedRequests = 0;
 
 // Long enough for the largest values each sensor can report.
@@ -38,14 +44,55 @@ void countPulse() {
     pulseCount++;
 }
 
-// ---------------------------------------------------------------- Solenoid
+// ---------------------------------------------------------------- Relay outputs
+
+void setRelay(uint8_t pin, bool on) {
+    digitalWrite(pin, on ? VALVE_OPEN_LEVEL : !VALVE_OPEN_LEVEL);
+}
 
 void setValve(bool open) {
-    digitalWrite(VALVE_PIN, open ? VALVE_OPEN_LEVEL : !VALVE_OPEN_LEVEL);
+    setRelay(VALVE_PIN, open);
     if (open != valveOpen) {
         Serial.println(open ? F("Valve: open") : F("Valve: closed"));
     }
     valveOpen = open;
+}
+
+void setPump(bool on) {
+    setRelay(PUMP_PIN, on);
+    if (on && !pumpOn) pumpStartedAt = millis();
+    if (on != pumpOn) {
+        Serial.println(on ? F("Pump: on") : F("Pump: off"));
+    }
+    pumpOn = on;
+}
+
+void setLedStrip(bool on) {
+    setRelay(LED_STRIP_PIN, on);
+    if (on != ledOn) {
+        Serial.println(on ? F("LED strip: on") : F("LED strip: off"));
+    }
+    ledOn = on;
+}
+
+// The valve and pump are one switch: the backend's single /api/valve setting drives both.
+void setWater(bool on) {
+    setValve(on);
+    setPump(on);
+}
+
+// Checked every pass of loop(), including while WiFi is down.
+void enforcePumpLimits() {
+    if (!pumpOn) return;
+
+    if (millis() - pumpStartedAt >= PUMP_MAX_RUN_MS) {
+        Serial.println(F("Pump: run-time limit reached, closing the valve too"));
+        waterLockedOut = true;
+        setWater(false);
+    } else if (millis() - lastBackendReply >= PUMP_FAILSAFE_MS) {
+        Serial.println(F("Pump: no contact with the backend, stopping"));
+        setPump(false);
+    }
 }
 
 // ---------------------------------------------------------------- Backend
@@ -65,6 +112,7 @@ int backendGet(const char *requestPath, char *body, size_t bodySize) {
         }
     } else {
         failedRequests = 0;
+        lastBackendReply = millis();
         if (status != 200) {
             Serial.print(F("Backend replied "));
             Serial.print(status);
@@ -75,17 +123,30 @@ int backendGet(const char *requestPath, char *body, size_t bodySize) {
     return status;
 }
 
-void pollValve() {
+// Asks the backend for a 0/1 setting. Returns 1 or 0 as it says, or -1 if there was no usable
+// reply (no connection, an error status such as 404, or an unexpected body).
+int pollFlag(const char *requestPath) {
     char body[8];
-    if (backendGet("/api/valve", body, sizeof(body)) != 200) return;
+    if (backendGet(requestPath, body, sizeof(body)) != 200) return -1;
+    if (strcmp(body, "1") == 0) return 1;
+    if (strcmp(body, "0") == 0) return 0;
+    return -1;
+}
 
-    // If the backend can't be reached the valve stays as it is, so a WiFi dropout doesn't
-    // cut off the water or leave it unexpectedly switched.
-    if (strcmp(body, "1") == 0) {
-        setValve(true);
-    } else if (strcmp(body, "0") == 0) {
-        setValve(false);
+void pollOutputs() {
+    // With no usable reply an output stays as it is, so a WiFi dropout doesn't cut off the
+    // water or leave a relay unexpectedly switched. The pump is the exception: it has its own
+    // failsafe in enforcePumpLimits().
+    const int water = pollFlag("/api/valve");
+    if (water == 0) {
+        waterLockedOut = false;
+        setWater(false);
+    } else if (water == 1 && !waterLockedOut) {
+        setWater(true);
     }
+
+    const int led = pollFlag("/api/led");
+    if (led >= 0) setLedStrip(led == 1);
 }
 
 // ---------------------------------------------------------------- YF-S201
@@ -210,10 +271,14 @@ void sendElectricity() {
 // ----------------------------------------------------------------
 
 void setup() {
-    // Set the level before enabling the output, so the valve can't click open at boot.
-    // It stays closed until the backend says otherwise, which matches the backend's default.
+    // Set the level before enabling each output, so nothing switches on at boot. Everything
+    // stays off until the backend says otherwise, which matches the backend's default.
     digitalWrite(VALVE_PIN, !VALVE_OPEN_LEVEL);
+    digitalWrite(PUMP_PIN, !VALVE_OPEN_LEVEL);
+    digitalWrite(LED_STRIP_PIN, !VALVE_OPEN_LEVEL);
     pinMode(VALVE_PIN, OUTPUT);
+    pinMode(PUMP_PIN, OUTPUT);
+    pinMode(LED_STRIP_PIN, OUTPUT);
 
     Serial.begin(115200);
     Serial.println(F("IOT node starting"));
@@ -225,11 +290,14 @@ void setup() {
     espBegin();
 
     lastWaterSend = millis();
+    lastBackendReply = millis();
     wifiConnected = espConnectWifi();
     lastWifiAttempt = millis();
 }
 
 void loop() {
+    enforcePumpLimits();
+
     if (!wifiConnected) {
         if (millis() - lastWifiAttempt >= WIFI_RETRY_MS) {
             wifiConnected = espConnectWifi();
@@ -239,7 +307,7 @@ void loop() {
     }
 
     if (millis() - lastValvePoll >= VALVE_POLL_MS) {
-        pollValve();
+        pollOutputs();
         lastValvePoll = millis();
     }
     if (wifiConnected && millis() - lastWaterSend >= WATER_SEND_MS) {
